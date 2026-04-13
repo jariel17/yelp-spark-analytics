@@ -1,0 +1,32 @@
+# Markdown docs (tracked separately)
+*.md
+
+# Credenciales
+.env
+
+# Dataset Yelp (muy grande, terminos de uso)
+data/raw/
+
+# Cache local de parquet (generado por analytics/spark_queries.py)
+data/cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.uv/
+*.egg-info/
+dist/
+build/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Graficos generados
+graficos/
+
+# OS
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
