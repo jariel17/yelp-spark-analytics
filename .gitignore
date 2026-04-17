@@ -9,6 +9,8 @@ data/raw/
 
 # Cache local de parquet (generado por analytics/spark_queries.py)
 data/cache/
+data/raw_trimmed
+data/filtered_trimmed
 
 # Python
 __pycache__/
@@ -30,3 +32,10 @@ graficos/
 .DS_Store
 Thumbs.db
 *:Zone.Identifier
+
+# PDF files
+*.pdf
+
+# Add Readme
+!README.md
+!README.en.md

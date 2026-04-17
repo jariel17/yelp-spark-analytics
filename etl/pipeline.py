@@ -1,306 +1,460 @@
 """
-Pipeline ETL completo
+Pipeline de Extracción y Transformación
 
-Spark maneja lectura, transformación y escritura de extremo a extremo.
 
-Ejecutar:
-    uv run etl/pipeline.py
-
-Flujo:
-    1. Configuración    — variables de entorno y constantes
-    2. Spark            — sesión con drivers JDBC y MongoDB
-    3. Lectura          — JSON crudos del dataset Yelp
-    4. Limpieza         — filtros, trim, fillna sobre business
-    5. Transformación   — fragmentación en 5 DataFrames por destino
-    6. Validación       — conteos y muestra antes de escribir
-    7. Carga            — escritura a CockroachDB y MongoDB Atlas
+Ejecución:
+    uv run python etl/pipeline.py
 """
+import json
 import os
-from urllib.parse import urlparse
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from dotenv import load_dotenv
+import random
+import time
 
 # =============================================================================
-# 1. CONFIGURACIÓN
+# CONFIGURACIÓN
 # =============================================================================
 
-load_dotenv()
+RAW_DIR = "/home/tux/big-data-project/data/raw"
+TRIMMED_DIR = "/home/tux/big-data-project/data/raw_trimmed"
+FILTERED_TRIMMED_DIR = "/home/tux/big-data-project/data/filtered_trimmed"
 
-CRDB_CONNECTION         = os.getenv("CRDB_CONNECTION")
-ATLAS_URI_DIMENSIONS    = os.getenv("ATLAS_URI_DIMENSIONS")
-ATLAS_URI_CHECKINS_TIPS = os.getenv("ATLAS_URI_CHECKINS_TIPS")
+YEAR_MIN = 2018
+YEAR_MAX = 2021
 
-CRDB_DATA_LOADED            = os.getenv("CRDB_DATA_LOADED",            "false").lower() == "true"
-ATLAS_DIMENSIONS_LOADED     = os.getenv("ATLAS_DIMENSIONS_LOADED",     "false").lower() == "true"
-ATLAS_BUSINESS_FACTS_LOADED = os.getenv("ATLAS_BUSINESS_FACTS_LOADED", "false").lower() == "true"
-ATLAS_CHECKINS_TIPS_LOADED  = os.getenv("ATLAS_CHECKINS_TIPS_LOADED",  "false").lower() == "true"
+USER_SAMPLE_FRACTION = 0.40
+REVIEW_SAMPLE_FRACTION = 0.20
+SAMPLE_SEED = 42
 
-# Si el cluster de dimensions se acerca al límite de 512 MB, bajar a 0.95
-DIMENSIONS_SAMPLE_FRACTION = float(os.getenv("DIMENSIONS_SAMPLE_FRACTION", "1.0"))
+USER_DROP = {"friends"}
+USER_DROP_PREFIX = "compliment_"
+BUSINESS_DROP = {"address", "postal_code", "latitude", "longitude"}
 
-DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+TRIM_FILES = [
+    "yelp_academic_dataset_user.json",
+    "yelp_academic_dataset_business.json",
+]
 
-# =============================================================================
-# 2. SESIÓN DE SPARK
-# =============================================================================
-
-# org.postgresql       → driver JDBC para CockroachDB (protocolo PostgreSQL)
-# mongo-spark-connector → conector oficial MongoDB para Spark 3.x / Scala 2.13
-spark = SparkSession.builder \
-    .appName("YelpBigData-Pipeline") \
-    .master("local[*]") \
-    .config("spark.driver.memory", "4g") \
-    .config("spark.sql.shuffle.partitions", "8") \
-    .config("spark.jars.packages",
-            "org.postgresql:postgresql:42.7.3,"
-            "org.mongodb.spark:mongo-spark-connector_2.13:10.3.0") \
-    .getOrCreate()
-
-spark.sparkContext.setLogLevel("WARN")
+FINAL_FILES = [
+    "yelp_academic_dataset_user.json",
+    "yelp_academic_dataset_review.json",
+    "yelp_academic_dataset_tip.json",
+    "yelp_academic_dataset_checkin.json",
+    "yelp_academic_dataset_business.json",
+]
 
 # =============================================================================
-# 3. LECTURA DE FUENTES
+# FUNCIONES AUXILIARES
 # =============================================================================
 
-print("\n=== Lectura de fuentes ===")
+def in_range(date_str: str, year_min: int, year_max: int) -> bool:
+    """True si los primeros 4 caracteres de date_str pertenece a un rango de años"""
+    if not date_str or len(date_str) < 4 or not date_str[:4].isdigit():
+        return False
+    esta_en_rango = year_min <= int(date_str[:4]) <= year_max
+    return esta_en_rango
 
-# business.json se usa para tres destinos distintos (listings, business_facts, dimensions)
-df_business = spark.read.json(os.path.join(DATA_PATH, "yelp_academic_dataset_business.json"))
-df_checkin  = spark.read.json(os.path.join(DATA_PATH, "yelp_academic_dataset_checkin.json"))
-df_tip      = spark.read.json(os.path.join(DATA_PATH, "yelp_academic_dataset_tip.json"))
 
-print("Archivos leídos — plan de ejecución construido, datos aún no procesados")
+def file_mb(path: str) -> float:
+    """Tamaño del archivo en MB."""
+    megabytes = os.path.getsize(path) / 1e6
+    return megabytes
+
+
+def count_lines(path: str) -> int:
+    """Número de líneas en un archivo JSON (= número de registros)."""
+    with open(path) as file_input:
+        total_lineas = sum(1 for _ in file_input)
+    return total_lineas
+
+
+def print_file_table(paths: list[str], label: str) -> None:
+    """Imprime tabla resumen: archivo | registros | MB para cada path."""
+    print(f"\n{'=' * 62}")
+    print(f"  {label}")
+    print(f"  {'Archivo':<30} {'Registros':>12}  {'Tamaño':>8}")
+    print(f"  {'-'*30} {'-'*12}  {'-'*8}")
+    total_mb = 0
+    total_n = 0
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        mb = file_mb(path)
+        n = count_lines(path)
+        nombre = (os.path.basename(path)
+                  .replace("yelp_academic_dataset_", "")
+                  .replace(".json", ""))
+        total_mb += mb
+        total_n += n
+        print(f"  {nombre:<30} {n:>12,}  {mb:>7.1f} MB")
+    print(f"  {'-'*30} {'-'*12}  {'-'*8}")
+    print(f"  {'TOTAL':<30} {total_n:>12,}  {total_mb:>7.1f} MB")
+    print(f"{'=' * 62}")
+
 
 # =============================================================================
-# 4. LIMPIEZA
+# OPERACIONES
 # =============================================================================
 
-print("\n=== Limpieza ===")
-
-# Limpieza base de business — se aplica una sola vez antes de fragmentar.
-#   - Filtro de PK: business_id nulo rompería el PRIMARY KEY en CockroachDB
-#   - trim(): evita que " Nevada" y "Nevada" sean valores distintos en GROUP BY
-#   - fillna(): evita que nulls se propaguen a agregaciones de SparkSQL
-df_business = (
-    df_business
-    .filter(F.col("business_id").isNotNull())
-    .withColumn("name",  F.trim(F.col("name")))
-    .withColumn("city",  F.trim(F.col("city")))
-    .withColumn("state", F.trim(F.col("state")))
-    .fillna({"is_open": 0, "review_count": 0})
-)
-
-# checkins: solo descartar eventos sin negocio
-df_checkin = df_checkin.filter(F.col("business_id").isNotNull())
-
-# tips: descartar eventos sin claves de referencia + fillna en la métrica
-df_tip = (
-    df_tip
-    .filter(F.col("business_id").isNotNull() & F.col("user_id").isNotNull())
-    .fillna({"compliment_count": 0})
-)
-
-print("Limpieza aplicada")
-
-# =============================================================================
-# 5. TRANSFORMACIÓN
-# =============================================================================
-
-print("\n=== Transformación ===")
-
-# listings — DIMENSIONES en CockroachDB
-# Solo atributos descriptivos estáticos: quién es el negocio y dónde está.
-# stars y review_count se excluyen (son métricas dinámicas), irán a business_facts.
-df_listings = df_business.select(
-    F.col("business_id"),
-    F.col("name"),
-    F.col("city"),
-    F.col("state"),
-    F.col("is_open").cast("int"),
-)
-
-# business_facts — HECHOS en MongoDB (cluster Ariel)
-# Métricas que cambian con cada nueva reseña. Estos son datos que en teoría vendrían de kafka
-df_business_facts = df_business.select(
-    F.col("business_id"),
-    F.col("stars").cast("decimal(2,1)").alias("avg_stars"),
-    F.col("review_count").cast("int"),
-)
-
-# dimensions — DIMENSIONES semiestructuradas en MongoDB (cluster Ariel)
-# attributes, hours y categories tienen esquema irregular entre negocios,
-# MongoDB es el destino natural para estos campos que no siguen un esquema fijo.
-df_dimensions = df_business.select(
-    F.col("business_id"),
-    F.col("attributes"),
-    F.col("hours"),
-    F.col("categories"),
-)
-# if DIMENSIONS_SAMPLE_FRACTION < 1.0:
-#     print(f"  Aplicando sample a dimensions: {DIMENSIONS_SAMPLE_FRACTION:.0%}")
-#     df_dimensions = df_dimensions.sample(fraction=DIMENSIONS_SAMPLE_FRACTION, seed=42)
-
-# checkins — HECHOS transaccionales en MongoDB (cluster B)
-# Se carga sin explode — el campo date es un string con timestamps separados
-# por coma. El explode ocurre en Spark al leer
-# evitar 13M filas en la BD de free tier.
-df_checkins = df_checkin
-
-# tips — HECHOS transaccionales en MongoDB (cluster B)
-# Cada documento es un evento: usuario, negocio, texto, fecha y métrica.
-df_tips = df_tip.select(
-    F.col("user_id"),
-    F.col("business_id"),
-    F.col("text"),
-    F.col("date"),
-    F.col("compliment_count").cast("int"),
-)
-
-print("Transformaciones aplicadas")
-
-# =============================================================================
-# 6. VALIDACIÓN
-# =============================================================================
-
-print("\n=== Validación ===")
-
-# Las acciones count() disparan la ejecución del plan de Spark aquí.
-# Si algo falla (archivo corrupto, campo faltante), falla antes de escribir.
-datasets = {
-    "listings       (CockroachDB)": df_listings,
-    "business_facts (MongoDB)":     df_business_facts,
-    "dimensions     (MongoDB)":     df_dimensions,
-    "checkins       (MongoDB)":     df_checkins,
-    "tips           (MongoDB)":     df_tips,
-}
-
-for nombre, df in datasets.items():
-    print(f"  {nombre}: {df.count():,} registros")
-    df.show(2, truncate=80)
-
-# =============================================================================
-# 7. CARGA
-# =============================================================================
-
-print("\n=== Carga ===")
-
-# Verificar que todos los destinos ya están cargados antes de continuar
-todo_cargado = (
-    CRDB_DATA_LOADED
-    and ATLAS_DIMENSIONS_LOADED
-    and ATLAS_BUSINESS_FACTS_LOADED
-    and (ATLAS_CHECKINS_TIPS_LOADED or not ATLAS_URI_CHECKINS_TIPS)
-)
-if todo_cargado:
-    print("Todos los destinos ya cargados. Saliendo sin cambios.")
-    spark.stop()
-    exit(0)
-
-if not CRDB_CONNECTION:
-    raise ValueError("CRDB_CONNECTION no está definido en .env")
-if not ATLAS_URI_DIMENSIONS:
-    raise ValueError("ATLAS_URI_DIMENSIONS no está definido en .env")
-
-
-def construir_jdbc(crdb_conn: str) -> tuple[str, dict]:
+def trim_fields(
+    source: str,
+    destination: str,
+    drop: set[str],
+    drop_prefix: str = "",
+) -> int:
     """
-    Convierte la cadena de conexión a formato JDBC para Spark.
-
-    psycopg2 acepta: postgresql://user:pass@host:port/db?sslmode=verify-full
-    JDBC necesita:   jdbc:postgresql://host:port/db?sslmode=verify-full
-    con user/password como propiedades separadas.
+    Reduce el peso de un archivo JSON eliminando campos innecesarios antes de procesarlo.
+    Soporta eliminación por nombre exacto y por prefijo, recorriendo el archivo línea a línea.
     """
-    parsed   = urlparse(crdb_conn)
-    cert     = os.path.expanduser("~/.postgresql/root.crt")
-    jdbc_url = (
-        f"jdbc:postgresql://{parsed.hostname}:{parsed.port}{parsed.path}"
-        f"?sslmode=verify-full&sslrootcert={cert}"
+    total = 0
+    # Recorre el archivo de origen línea a línea (un JSON por línea) y escribe
+    # cada registro ya limpio en el destino, sin cargar el archivo completo en memoria
+    with open(source) as file_input, open(destination, "w") as file_output:
+        for line in file_input:
+            registro = json.loads(line)
+            # Elimina campos exactos (ej. "friends")
+            for field in drop:
+                registro.pop(field, None)
+            # Elimina campos por prefijo (ej. todos los "compliment_*")
+            if drop_prefix:
+                registro = {k: v for k, v in registro.items()
+                            if not k.startswith(drop_prefix)}
+            file_output.write(json.dumps(registro, ensure_ascii=False) + "\n")
+            total += 1
+    return total
+
+
+def sample_users(
+    source: str,
+    destination: str,
+    fraction: float,
+    seed: int,
+) -> set[str]:
+    """
+    Selecciona un subconjunto reproducible de usuarios para reducir el volumen del dataset.
+    Usa muestreo aleatorio con semilla fija y retorna los user_ids elegidos, que luego
+    sirven como filtro de integridad referencial para reviews y tips.
+    """
+    # Semilla fija para que el muestreo sea reproducible entre ejecuciones
+    generador = random.Random(seed)
+    user_ids: set[str] = set()
+    leidos = escritos = 0
+
+    # Recorre todos los usuarios y escribe solo los seleccionados al destino,
+    # acumulando sus IDs en memoria para usarlos como filtro en cascade_filter
+    with open(source) as file_input, open(destination, "w") as file_output:
+        for line in file_input:
+            leidos += 1
+            # generador.random() produce un float uniforme en [0, 1); se incluye
+            # el registro si cae por debajo del umbral (fracción deseada)
+            if generador.random() < fraction:
+                file_output.write(line)
+                user_ids.add(json.loads(line)["user_id"])
+                escritos += 1
+
+    mb_origen = file_mb(source)
+    mb_destino = file_mb(destination)
+    print(f"[OK] user: {leidos:,} -> {escritos:,} ({int(fraction*100)}%)  "
+          f"{mb_origen:.1f} MB -> {mb_destino:.1f} MB")
+    print(f"     user_ids en memoria: {len(user_ids):,}")
+    return user_ids
+
+
+def cascade_filter(
+    source: str,
+    destination: str,
+    user_ids: set[str],
+    progress_every: int = 0,  # si > 0, imprime una línea de progreso cada N registros leídos
+) -> tuple[int, int]:
+    """
+    Garantiza integridad referencial entre colecciones: solo pasan los registros
+    cuyo user_id existe en el subconjunto de usuarios ya muestreado. 
+    """
+    leidos = escritos = 0
+    inicio = time.time()
+
+    # Recorre el archivo fuente completo y copia al destino solo los registros
+    # que pasan el filtro de user_id, descartando el resto
+    with open(source) as file_input, open(destination, "w") as file_output:
+        for line in file_input:
+            leidos += 1
+            # Solo se conservan registros cuyo user_id pertenece al subconjunto muestreado
+            if json.loads(line).get("user_id") in user_ids:
+                file_output.write(line)
+                escritos += 1
+            # Progreso opcional para archivos grandes (ej. reviews con 7M+ líneas)
+            if progress_every and leidos % progress_every == 0:
+                print(f"  {leidos/1e6:.0f}M leídas / {escritos:,} escritas  "
+                      f"({time.time() - inicio:.0f}s)")
+
+    # Reporte final: muestra registros leídos vs escritos, tamaño resultante y tiempo total
+    mb_destino = file_mb(destination)
+    nombre = (os.path.basename(source)
+              .replace("yelp_academic_dataset_", "").replace(".json", ""))
+    print(f"[OK] {nombre}: {leidos:,} -> {escritos:,}  "
+          f"{mb_destino:.1f} MB  ({time.time()-inicio:.1f}s)")
+    return leidos, escritos
+
+
+def filter_date_inplace(
+    path: str,
+    field: str,
+    year_min: int,
+    year_max: int,
+) -> tuple[int, int]:
+    """
+    Recorta un archivo JSON al período de interés sin duplicar el archivo de origen.
+    Escribe en un temporal y hace un replace atómico al final para evitar
+    dejar el archivo en estado inconsistente si el proceso es interrumpido.
+    """
+    # Se escribe en un archivo temporal para no corromper el original si el proceso falla
+    ruta_temporal = path + ".tmp"
+    leidos = escritos = 0
+    inicio = time.time()
+
+    # Lee el archivo original y escribe en el temporal solo los registros
+    # cuya fecha cae dentro del período definido
+    with open(path) as file_input, open(ruta_temporal, "w") as file_output:
+        for line in file_input:
+            leidos += 1
+            # in_range extrae el año del campo y verifica que esté dentro del rango
+            if in_range(json.loads(line).get(field, ""), year_min, year_max):
+                file_output.write(line)
+                escritos += 1
+
+    # Reemplaza el original con el filtrado — os.replace es atómico en la mayoría de SO
+    os.replace(ruta_temporal, path)
+    # Reporte final: muestra registros leídos vs escritos, tamaño resultante y tiempo total
+    mb = file_mb(path)
+    nombre = (os.path.basename(path)
+              .replace("yelp_academic_dataset_", "").replace(".json", ""))
+    print(f"[OK] {nombre}: {leidos:,} -> {escritos:,}  "
+          f"{mb:.1f} MB  ({time.time()-inicio:.1f}s)")
+    return leidos, escritos
+
+
+def filter_checkins(
+    source: str,
+    destination: str,
+    year_min: int,
+    year_max: int,
+) -> tuple[int, int]:
+    """
+    Filtra checkins al período de interés respetando su formato especial: el campo
+    date contiene múltiples timestamps en un solo string separado por comas, por lo
+    que el filtrado opera timestamp a timestamp dentro de cada registro, no por registro.
+    """
+    leidos = escritos = 0
+    inicio = time.time()
+
+    # Recorre cada negocio y filtra su lista de timestamps individualmente,
+    # descartando el registro completo solo si ningún timestamp queda dentro del rango
+    with open(source) as file_input, open(destination, "w") as file_output:
+        for line in file_input:
+            leidos += 1
+            registro = json.loads(line)
+            # El campo "date" es un string con timestamps separados por coma
+            timestamps_validos = [
+                d for d in (s.strip() for s in registro.get("date", "").split(","))
+                if in_range(d, year_min, year_max)
+            ]
+            if timestamps_validos:
+                registro["date"] = ", ".join(timestamps_validos)
+                file_output.write(json.dumps(registro, ensure_ascii=False) + "\n")
+                escritos += 1
+
+    # Reporte final: muestra registros leídos vs escritos, tamaño resultante y tiempo total
+    mb = file_mb(destination)
+    print(f"[OK] checkin: {leidos:,} -> {escritos:,}  "
+          f"{mb:.1f} MB  ({time.time()-inicio:.1f}s)")
+    return leidos, escritos
+
+
+def sample_inplace(
+    path: str,
+    fraction: float,
+    seed: int,
+) -> tuple[int, int]:
+    """
+    Reduce el volumen de un archivo ya filtrado mediante muestreo aleatorio reproducible.
+    Opera in-place con el mismo patrón de archivo temporal que filter_date_inplace.
+    """
+    # Mismo patrón que filter_date_inplace: escribir en temporal antes de reemplazar
+    ruta_temporal = path + ".tmp"
+    generador = random.Random(seed)
+    leidos = escritos = 0
+    inicio = time.time()
+
+    # Lee el archivo ya filtrado y escribe en el temporal solo la fracción seleccionada,
+    # reduciendo el volumen antes de la carga a la nube
+    with open(path) as file_input, open(ruta_temporal, "w") as file_output:
+        for line in file_input:
+            leidos += 1
+            # generador.random() produce un float uniforme en [0, 1); se incluye
+            # el registro si cae por debajo del umbral (fracción deseada)
+            if generador.random() < fraction:
+                file_output.write(line)
+                escritos += 1
+
+    os.replace(ruta_temporal, path)
+    # Reporte final: muestra registros leídos vs escritos, tamaño resultante y tiempo total
+    mb = file_mb(path)
+    nombre = (os.path.basename(path)
+              .replace("yelp_academic_dataset_", "").replace(".json", ""))
+    print(f"[OK] {nombre}: {leidos:,} -> {escritos:,} ({int(fraction*100)}%)  "
+          f"{mb:.1f} MB  ({time.time()-inicio:.1f}s)")
+    return leidos, escritos
+
+
+# =============================================================================
+# PIPELINE
+# =============================================================================
+
+if __name__ == "__main__":
+    os.makedirs(TRIMMED_DIR, exist_ok=True)
+    os.makedirs(FILTERED_TRIMMED_DIR, exist_ok=True)
+
+    # --- 1. Recorte de campos: user.json -------
+    # Se eliminan: "friends" (lista masiva sin uso analítico) y todos los "compliment_*"
+    print("\n=== [1] user.json — drop friends + compliment_* ===")
+    inicio = time.time()
+    source_user = os.path.join(RAW_DIR, "yelp_academic_dataset_user.json")
+    destination_user = os.path.join(TRIMMED_DIR, "yelp_academic_dataset_user.json")
+
+    total = trim_fields(source_user, destination_user, drop=USER_DROP, drop_prefix=USER_DROP_PREFIX)
+
+    print(f"[OK] user: {total:,} registros  "
+          f"{file_mb(source_user):.1f} MB -> {file_mb(destination_user):.1f} MB  "
+          f"(-{(1 - file_mb(destination_user)/file_mb(source_user))*100:.0f}%)  "
+          f"({time.time()-inicio:.1f}s)")
+
+    # --- 2. Recorte de campos: business.json -------
+    # Se eliminan: "address", "postal_code", "latitude", "longitude" (datos de ubicación exacta, irrelevantes para el análisis)
+    print("\n=== [2] business.json — drop address, postal_code, latitude, longitude ===")
+    inicio = time.time()
+    source_business = os.path.join(RAW_DIR, "yelp_academic_dataset_business.json")
+    destination_business = os.path.join(TRIMMED_DIR, "yelp_academic_dataset_business.json")
+
+    total = trim_fields(source_business, destination_business, drop=BUSINESS_DROP)
+
+    print(f"[OK] business: {total:,} registros  "
+          f"{file_mb(source_business):.1f} MB -> {file_mb(destination_business):.1f} MB  "
+          f"(-{(1 - file_mb(destination_business)/file_mb(source_business))*100:.0f}%)  "
+          f"({time.time()-inicio:.1f}s)")
+
+    # Reporte: comparativa RAW vs TRIMMED
+    print(f"\n{'=' * 58}")
+    print(f"  {'Archivo':<30} {'RAW':>9}  {'TRIMMED':>9}  {'Δ':>6}")
+    print(f"  {'-'*30} {'-'*9}  {'-'*9}  {'-'*6}")
+    total_mb_origen = total_mb_destino = 0
+
+    # Itera sobre los archivos recortados para comparar su tamaño antes y después del trim,
+    # acumulando los totales para mostrar el ahorro global al final de la tabla
+    for nombre_archivo in TRIM_FILES:
+        mb_origen = file_mb(os.path.join(RAW_DIR, nombre_archivo))
+        mb_destino = file_mb(os.path.join(TRIMMED_DIR, nombre_archivo))
+        total_mb_origen += mb_origen
+        total_mb_destino += mb_destino
+        nombre = nombre_archivo.replace("yelp_academic_dataset_", "").replace(".json", "")
+        print(f"  {nombre:<30} {mb_origen:>8.1f}  {mb_destino:>8.1f}  "
+              f"{-(1 - mb_destino/mb_origen)*100:>5.0f}%")
+
+    print(f"  {'-'*30} {'-'*9}  {'-'*9}  {'-'*6}")
+    print(f"  {'TOTAL':<30} {total_mb_origen:>8.1f}  {total_mb_destino:>8.1f}  "
+          f"{-(1 - total_mb_destino/total_mb_origen)*100:>5.0f}%")
+    print(f"{'=' * 58}")
+
+    # --- 3. Muestreo de usuarios --------------
+    # Se toma el archivo ya recortado (raw_trimmed) como fuente, no el raw original,
+    # para que los usuarios muestreados ya vengan sin los campos eliminados en el paso 1.
+    # Los user_ids retornados se guardan en memoria y se usan en los pasos 4 y 5.
+    # USER_SAMPLE_FRACTION indica la cantidad a conservar (40%)
+    print(f"\n=== [3] muestreo user {int(USER_SAMPLE_FRACTION*100)}% "
+          f"(seed={SAMPLE_SEED}) — fuente: raw_trimmed ===")
+    inicio = time.time()
+    user_ids = sample_users(
+        source=os.path.join(TRIMMED_DIR, "yelp_academic_dataset_user.json"),
+        destination=os.path.join(FILTERED_TRIMMED_DIR, "yelp_academic_dataset_user.json"),
+        fraction=USER_SAMPLE_FRACTION,
+        seed=SAMPLE_SEED,
     )
-    props = {
-        "driver":   "org.postgresql.Driver",
-        "user":     parsed.username,
-        "password": parsed.password,
-    }
-    return jdbc_url, props
+    print(f"  ({time.time()-inicio:.1f}s)")
 
+    # --- 4. Filtro en cascada: reviews --------------
+    # Se lee desde raw (no trimmed) porque reviews no tiene campos que recortar.
+    # Se activa progress_every dado que el archivo completo supera los 7M de registros.
+    print("\n=== [4] cascade review — fuente: raw ===")
+    cascade_filter(
+        source=os.path.join(RAW_DIR, "yelp_academic_dataset_review.json"),
+        destination=os.path.join(FILTERED_TRIMMED_DIR, "yelp_academic_dataset_review.json"),
+        user_ids=user_ids,
+        progress_every=1_000_000,
+    )
 
-def cargar_listings(df: DataFrame, jdbc_url: str, props: dict) -> None:
-    """
-    Escribe df_listings a CockroachDB tabla 'listings' via JDBC.
+    # --- 5. Filtro en cascada: tips -----------------
+    # Mismo criterio que reviews: fuente raw y filtro por los user_ids del paso 3.
+    # No requiere progress_every porque tips es significativamente más pequeño.
+    print("\n=== [5] cascade tip — fuente: raw ===")
+    cascade_filter(
+        source=os.path.join(RAW_DIR, "yelp_academic_dataset_tip.json"),
+        destination=os.path.join(FILTERED_TRIMMED_DIR, "yelp_academic_dataset_tip.json"),
+        user_ids=user_ids,
+    )
 
-    createTableColumnTypes le da a Spark los tipos SQL exactos para el DDL
-    generado.
-    """
-    print("  Escribiendo listings → CockroachDB...")
-    df.write \
-        .format("jdbc") \
-        .option("url", jdbc_url) \
-        .option("dbtable", "listings") \
-        .option("driver", props["driver"]) \
-        .option("user", props["user"]) \
-        .option("password", props["password"]) \
-        .option("numPartitions", "4") \
-        .mode("overwrite") \
-        .save()
-    print("  listings: cargado")
+    # Reporte: post-cascade (antes del filtrado temporal)
+    print_file_table(
+        paths=[os.path.join(FILTERED_TRIMMED_DIR, f) for f in [
+            "yelp_academic_dataset_user.json",
+            "yelp_academic_dataset_review.json",
+            "yelp_academic_dataset_tip.json",
+        ]],
+        label="Post-cascade (antes del filtrado temporal)",
+    )
 
+    # --- 6. Filtrado temporal: reviews --------------
+    print(f"\n=== [6] review — filtrar {YEAR_MIN}–{YEAR_MAX} ===")
+    filter_date_inplace(
+        path=os.path.join(FILTERED_TRIMMED_DIR, "yelp_academic_dataset_review.json"),
+        field="date", year_min=YEAR_MIN, year_max=YEAR_MAX,
+    )
 
-def cargar_mongo(df: DataFrame, uri: str, coleccion: str) -> None:
-    """
-    Escribe un DataFrame a una colección de MongoDB Atlas.
+    # --- 7. Filtrado temporal: tips -----------------
+    print(f"\n=== [7] tip — filtrar {YEAR_MIN}–{YEAR_MAX} ===")
+    filter_date_inplace(
+        path=os.path.join(FILTERED_TRIMMED_DIR, "yelp_academic_dataset_tip.json"),
+        field="date", year_min=YEAR_MIN, year_max=YEAR_MAX,
+    )
 
-    Recibe el URI como parámetro para poder escribir a clusters distintos
-    desde el mismo script. mode overwrite garantiza idempotencia.
-    """
-    print(f"  Escribiendo {coleccion} → MongoDB Atlas...")
-    df.write \
-        .format("mongodb") \
-        .option("connection.uri", uri) \
-        .option("database",       "yelp") \
-        .option("collection",     coleccion) \
-        .mode("overwrite") \
-        .save()
-    print(f"  {coleccion}: cargado")
+    # --- 8. Filtrado temporal: checkins -------------
+    print(f"\n=== [8] checkin — filtrar {YEAR_MIN}–{YEAR_MAX} desde raw ===")
+    filter_checkins(
+        source=os.path.join(RAW_DIR, "yelp_academic_dataset_checkin.json"),
+        destination=os.path.join(FILTERED_TRIMMED_DIR, "yelp_academic_dataset_checkin.json"),
+        year_min=YEAR_MIN, year_max=YEAR_MAX,
+    )
 
+    # Reporte: dataset completo antes del muestreo de reviews
+    print_file_table(
+        paths=[os.path.join(FILTERED_TRIMMED_DIR, f) for f in FINAL_FILES],
+        label="filtered_trimmed completo",
+    )
 
-# --- CockroachDB ---
-if not CRDB_DATA_LOADED:
-    print("\n[CockroachDB]")
-    jdbc_url, jdbc_props = construir_jdbc(CRDB_CONNECTION)
-    cargar_listings(df_listings, jdbc_url, jdbc_props)
-    print("  → Actualiza CRDB_DATA_LOADED=true en .env")
-else:
-    print("[CockroachDB] CRDB_DATA_LOADED=true — omitiendo")
+    # --- 9. Muestreo de reviews ---------------
+    # Aun después del filtrado temporal y la cascada, reviews sigue siendo el archivo
+    # más grande. Se aplica un muestreo adicional in-place para llevarlo a un volumen
+    # manejable para la carga a la nube y los análisis locales con Spark.
+    # REVIEW_SAMPLE_FRACTION indica el porcentaje a conservar (20%)
+    print(f"\n=== [9] muestreo review {int(REVIEW_SAMPLE_FRACTION*100)}% "
+          f"(seed={SAMPLE_SEED}) — in-place en filtered_trimmed ===")
+    sample_inplace(
+        path=os.path.join(FILTERED_TRIMMED_DIR, "yelp_academic_dataset_review.json"),
+        fraction=REVIEW_SAMPLE_FRACTION,
+        seed=SAMPLE_SEED,
+    )
 
-# --- MongoDB Atlas — cluster Ariel (dimensions + business_facts) ---
-if not ATLAS_DIMENSIONS_LOADED:
-    print("\n[MongoDB Atlas — cluster propio — dimensions]")
-    cargar_mongo(df_dimensions, ATLAS_URI_DIMENSIONS, "dimensions")
-    print("  → Actualiza ATLAS_DIMENSIONS_LOADED=true en .env")
-else:
-    print("[MongoDB Atlas — cluster propio] ATLAS_DIMENSIONS_LOADED=true — omitiendo")
+    # Reporte: dataset final
+    print_file_table(
+        paths=[os.path.join(FILTERED_TRIMMED_DIR, f) for f in FINAL_FILES],
+        label="filtered_trimmed — dataset final",
+    )
 
-if not ATLAS_BUSINESS_FACTS_LOADED:
-    print("\n[MongoDB Atlas — cluster propio — business_facts]")
-    cargar_mongo(df_business_facts, ATLAS_URI_DIMENSIONS, "business_facts")
-    print("  → Actualiza ATLAS_BUSINESS_FACTS_LOADED=true en .env")
-else:
-    print("[MongoDB Atlas — cluster propio] ATLAS_BUSINESS_FACTS_LOADED=true — omitiendo")
-
-# --- MongoDB Atlas — cluster B (checkins + tips) ---
-if not ATLAS_CHECKINS_TIPS_LOADED:
-    if ATLAS_URI_CHECKINS_TIPS:
-        print("\n[MongoDB Atlas — cluster B]")
-        cargar_mongo(df_checkins, ATLAS_URI_CHECKINS_TIPS, "checkins")
-        cargar_mongo(df_tips,     ATLAS_URI_CHECKINS_TIPS, "tips")
-        print("  → Actualiza ATLAS_CHECKINS_TIPS_LOADED=true en .env")
-    else:
-        print("\n[MongoDB Atlas — cluster B] omitido — ATLAS_URI_CHECKINS_TIPS no definido")
-else:
-    print("[MongoDB Atlas — cluster B] ATLAS_CHECKINS_TIPS_LOADED=true — omitiendo")
-
-# =============================================================================
-
-print("\n=== Pipeline completado ===")
-spark.stop()
+    print("\n=== pipeline completo ===")
